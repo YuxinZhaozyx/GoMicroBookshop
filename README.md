@@ -27,6 +27,7 @@ A bookshop project for my go-micro and micro service learning
 
 - Golang环境 [安装](https://golang.google.cn/)
 - gRPC [安装](https://grpc.io/docs/quickstart/go.html)
+- Consul 
 - Micro
 
 ```shell
@@ -131,7 +132,7 @@ micro new --namespace=mu.micro.book --type=srv --alias=user github.com/YuxinZhao
 │   └── db                   * 数据库相关
 │   │    └── db.go           * 初始化数据库
 │   │    └── mysql.go        * mysql数据库相关
-│   └── basic                * 初始化基础组件
+│   └── basic.go             * 初始化基础组件
 ├── conf                     * 配置文件目录
 ├── handler
 │   └── user.go              * 将名称改为user
@@ -433,6 +434,8 @@ import (
 
 	"github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/basic/config"
 	"github.com/micro/go-micro/util/log"
+    
+    _ "github.com/go-sql-driver/mysql"
 )
 
 func initMysql() {
@@ -607,9 +610,7 @@ handler直接调用模型层方法获取数据并回传给rsp结构。
 
 #### main
 
-
-
-#### main.go
+main.go
 
 ```go
 package main
@@ -723,3 +724,420 @@ micro --registry=consul call mu.micro.book.srv.user User.QueryUserByName "{\"use
 
 user-srv服务搭建完成。
 
+### user-web
+
+**web**服务负责暴露接口给用户，用户请求登录，**web**通过用户名**userName**向**service**获取用户信息，再比对密码，正确则登录成功，反之返回错误。
+
+请求链如下图
+
+[![img](image/part1_user_login_process.png)](https://github.com/micro-in-cn/tutorials/blob/master/microservice-in-micro/docs/part1_user_login_process.png)
+
+
+
+#### 新建模板
+
+```shell
+micro new --namespace=mu.micro.book --type=web --alias=user github.com/YuxinZhaozyx/GoMicroBookshop/user-web
+```
+
+**目录树**
+
+生成的目录树
+
+```
+.
+├── main.go
+├── plugin.go
+├── handler
+│   └── handler.go
+├── html
+│   └── index.html
+├── Dockerfile
+├── Makefile
+└── README.md
+```
+
+修改后：
+
+```
+.
+├── main.go
+├── plugin.go
+├── basic
+│   └── config
+│   │   └── config.go
+│   │   └── consul.go
+│   │   └── profiles.go
+│   └── basic.go
+├── conf
+│   └── application.yml
+│   └── application-consul.yml
+├── handler
+│   └── handler.go
+├── Dockerfile
+├── Makefile
+└── README.md
+```
+
+go-web是一个很简单的web开发库，它不像其它go语言的web框架有那么多工具集，它核心在两个方面
+
+- 让程序支持http请求
+- 天生属于Micro生态
+
+它不需要额外的代码就可以注册到Micro生态中，和其它类型的服务一样。
+
+**web**核心有三个地方
+
+- [config.go](./user-web/basic/config/config.go) 负责加载配置
+- [handler.go](./user-web/handler/handler.go) 负责处理请求
+- [main.go](./user-web/main.go) 程序运行入口
+
+#### config
+
+设置类似user-srv的设置，但去除mysql的配置。
+
+user-web/basic/config/config.go
+
+```go
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/micro/go-micro/config"
+	"github.com/micro/go-micro/config/source"
+	"github.com/micro/go-micro/config/source/file"
+	"github.com/micro/go-micro/util/log"
+)
+
+var (
+	err error
+)
+
+var (
+	defaultRootPath         = "app"
+	defaultConfigFilePrefix = "application-"
+	consulConfig            defaultConsulConfig
+	profiles                defaultProfiles
+	m                       sync.RWMutex
+	inited                  bool
+)
+
+// Init 初始化配置
+func Init() {
+	m.Lock()
+	defer m.Unlock()
+
+	if inited {
+		log.Logf("[Init] 配置已经初始化过")
+		return
+	}
+
+	// 加载yml配置
+	// 先加载基础配置
+	appPath, _ := filepath.Abs(filepath.Dir(filepath.Join("./", string(filepath.Separator))))
+
+	pt := filepath.Join(appPath, "conf")
+	os.Chdir(appPath)
+
+	// 找到application.yml文件
+	if err = config.Load(file.NewSource(file.WithPath(pt + "/application.yml"))); err != nil {
+		panic(err)
+	}
+
+	// 找到需要引入的新配置文件
+	if err = config.Get(defaultRootPath, "profiles").Scan(&profiles); err != nil {
+		panic(err)
+	}
+
+	log.Logf("[Init] 加载配置文件：path: %s, %+v\n", pt+"/application.yml", profiles)
+
+	// 开始导入新文件
+	if len(profiles.GetInclude()) > 0 {
+		include := strings.Split(profiles.GetInclude(), ",")
+
+		sources := make([]source.Source, len(include))
+		for i := 0; i < len(include); i++ {
+			filePath := pt + string(filepath.Separator) + defaultConfigFilePrefix + strings.TrimSpace(include[i]) + ".yml"
+
+			log.Logf("[Init] 加载配置文件：path: %s\n", filePath)
+
+			sources[i] = file.NewSource(file.WithPath(filePath))
+		}
+
+		// 加载include的文件
+		if err = config.Load(sources...); err != nil {
+			panic(err)
+		}
+	}
+
+	// 赋值
+	config.Get(defaultRootPath, "consul").Scan(&consulConfig)
+
+	// 标记已经初始化
+	inited = true
+}
+
+// GetConsulConfig 获取Consul配置
+func GetConsulConfig() (ret ConsulConfig) {
+	return consulConfig
+}
+```
+
+user-web/basic/config/consul.go
+
+```go
+package config
+
+// ConsulConfig consul 配置
+type ConsulConfig interface {
+	GetEnabled() bool
+	GetPort() int
+	GetHost() string
+}
+
+// defaultConsulConfig 默认consul 配置
+type defaultConsulConfig struct {
+	Enabled bool   `json:"enabled"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+}
+
+// GetPort consul 端口
+func (c defaultConsulConfig) GetPort() int {
+	return c.Port
+}
+
+// GetEnabled consul 激活
+func (c defaultConsulConfig) GetEnabled() bool {
+	return c.Enabled
+}
+
+// GetHost consul 主机地址
+func (c defaultConsulConfig) GetHost() string {
+	return c.Host
+}
+```
+
+user-web/basic/config/profiles.go
+
+```go
+package config
+
+// Profiles 属性配置文件
+type Profiles interface {
+	GetInclude() string
+}
+
+// defaultProfiles 属性配置文件
+type defaultProfiles struct {
+	Include string `json:"include"`
+}
+
+// Include 包含的配置文件
+// 名称前缀为"application-"，格式为yml，如："application-xxx.yml"
+// 多个文件名以逗号隔开，并省略掉前缀"application-"，如：dn, jpush, mysql
+func (p defaultProfiles) GetInclude() string {
+	return p.Include
+}
+```
+
+
+
+#### handler
+
+user-web/handler/handler.go
+
+```go
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	user "github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/proto/user"
+	"github.com/micro/go-micro/client"
+	"github.com/micro/go-micro/util/log"
+)
+
+var (
+	serviceClient user.UserService
+)
+
+// Error 错误结构体
+type Error struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+}
+
+func Init() {
+	serviceClient = user.NewUserService("mu.micro.book.srv.user", client.DefaultClient)
+}
+
+// Login 登录入口
+func Login(w http.ResponseWriter, r *http.Request) {
+	// 只接受POST请求
+	if r.Method != "POST" {
+		log.Logf("非法请求")
+		http.Error(w, "非法请求", 400)
+		return
+	}
+
+	r.ParseForm()
+
+	// 调用后台服务
+	rsp, err := serviceClient.QueryUserByName(context.TODO(), &user.Request{
+		UserName: r.Form.Get("userName"),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// 返回结果
+	response := map[string]interface{}{
+		"ref": time.Now().UnixNano(),
+	}
+
+	if rsp.User.Pwd == r.Form.Get("pwd") {
+		response["success"] = rsp.Success
+
+		// 干掉密码返回
+		rsp.User.Pwd = ""
+		response["data"] = rsp.User
+	} else {
+		response["success"] = false
+		response["error"] = &Error{
+			Detail: "密码错误",
+		}
+	}
+
+	w.Header().Add("Content-Type", "application/json; charset=utf-8")
+
+	// encode and write the response as json 返回json结构
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+}
+```
+
+#### main
+
+user-web/main.go
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/micro/go-micro/util/log"
+
+	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/basic"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/basic/config"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/handler"
+	"github.com/micro/cli"
+	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/registry/consul"
+	"github.com/micro/go-micro/web"
+)
+
+func main() {
+	// 初始化配置
+	basic.Init()
+
+	// 使用consul注册
+	micReg := consul.NewRegistry(registryOptions)
+
+	// create new web service 创建新服务
+	service := web.NewService(
+		web.Name("mu.micro.book.web.user"),
+		web.Version("latest"),
+		web.Registry(micReg),
+		web.Address(":8088"),
+	)
+
+	// initialise service 初始化服务
+	if err := service.Init(
+		web.Action(func(c *cli.Context) {
+			// 初始化handler
+			handler.Init()
+		}),
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	// register call handler 注册登录接口
+	service.HandleFunc("/user/login", handler.Login)
+
+	// run service 运行服务
+	if err := service.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func registryOptions(ops *registry.Options) {
+	consulCfg := config.GetConsulConfig()
+	ops.Timeout = time.Second * 5
+	ops.Addrs = []string{fmt.Sprintf("%s:%d", consulCfg.GetHost(), consulCfg.GetPort())}
+}
+```
+
+handler里定义了错误结构体**Error**、**Init**、**Login**方法。
+
+- **Init** 用来初始化handler需要用到的服务客户端
+- **Login** 处理登录请求
+
+**Login**在解析完参数后，通过RPC调用**service**的**QueryUserByName**方法。查出的结果后再进行密码匹配。
+
+匹配成功后便返回用户信息。
+
+#### 启动
+
+**启动consul**
+
+```shell
+consul agent -dev
+```
+
+**运行api**
+
+```shell
+micro --registry=consul --api_namespace=mu.micro.book.web  api --handler=web
+```
+
+**运行user-srv**
+
+```shell
+cd user-srv
+go run main.go plugin.go 
+```
+
+**运行user-web**
+
+```shell
+cd user-web
+go run main.go
+```
+
+#### 测试
+
+```shell
+curl --request POST --url http://127.0.0.1:8088/user/login --header 'Contentncoded' --data "userName=micro&pw-Type:application/x-ww-form-urlencoded" --data "userName=micro&pwd=1234"
+```
+
+输出：
+
+```json
+{"id":"go.micro.client","code":500,"detail":"connection error:
+dial tcp: address fdf5:da13:de04::e58:59504: too many colons in address","status":"Internal Server Error"}
+```
+
+go-micro暂不支持ipv6，待解决。
