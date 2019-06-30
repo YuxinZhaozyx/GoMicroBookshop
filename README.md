@@ -1130,10 +1130,10 @@ go run main.go
 #### 测试
 
 ```shell
-curl --request POST --url http://127.0.0.1:8088/user/login --header 'Contentncoded' --data "userName=micro&pw-Type:application/x-ww-form-urlencoded" --data "userName=micro&pwd=1234"
+curl --request POST --url http://127.0.0.1:8088/user/login --header "Content-Type:application/x-www-form-urlencoded" --data "userName=micro&pwd=1234"
 ```
 
-输出：
+错误输出：
 
 ```json
 {"id":"go.micro.client","code":500,"detail":"connection error:
@@ -1141,3 +1141,11 @@ dial tcp: address fdf5:da13:de04::e58:59504: too many colons in address","status
 ```
 
 go-micro暂不支持ipv6，待解决。
+
+正确输出：
+
+```json
+{"data":{"id":10001,"name":"micro"},"ref":1561869942897349500,"success":true}
+```
+
+隔日重启后各服务分配到的是ipv4而不是ipv6地址，程序正常执行，未找到原因，待解决。
