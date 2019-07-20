@@ -1149,3 +1149,1012 @@ go-micro暂不支持ipv6，待解决。
 ```
 
 隔日重启后各服务分配到的是ipv4而不是ipv6地址，程序正常执行，未找到原因，待解决。
+
+**注：此章完成时的快照是 658a0a3。**
+
+## 第二章 权限服务
+
+在本篇中，我们除了完成抽离公用基础包，还要实现请求认证服务auth（session管理我们需要放到下一章节来完成，因为现在我们的web服务太少，不方便看效果）。
+
+后面的章节中，user-web，orders-web等接收到的需要认证的请求都要向auth确认。
+
+本章我们要实现**Auth**服务的工作架构如下图：
+
+[![img](image/part2_auth_layer_view.png)](https://github.com/micro-in-cn/tutorials/blob/master/microservice-in-micro/docs/part2_auth_layer_view.png)
+
+- 当用户请求每个web服务时，会有**wrapper**调用**auth**确定认证结果，并缓存合法结果30分钟。
+- 当用户退出时，**auth**广播，各服务**sub**清掉缓存。
+
+我们的缓存使用**redis**。
+
+### 优化公有包
+
+新建一个basic目录用于存放共有代码，先将基础组件迁移到其中。然后我们增加**redis**配置与**jwt**配置，其中，jwt属于我们应用自身配置，下面很快我们会讲到，我们会把它放在**app.book**路径下。
+
+```
+├── README.md
+├── basic
+│   ├── basic.go
+│   ├── config
+│   │   ├── config.go
+│   │   ├── config_consul.go
+│   │   ├── config_mysql.go
+|   |   ├── redis.go
+│   │   └── profiles.go
+│   └── db
+│       ├── db.go
+│       └── mysql.go
+├── docs
+├── user-srv
+└── user-web
+```
+
+`basic/config/redis.go`
+
+```go
+package config
+
+import (
+	"strings"
+)
+
+// RedisConfig redis 配置
+type RedisConfig interface {
+	GetEnabled() bool
+	GetConn() string
+	GetPassword() string
+	GetDBNum() int
+	GetSentinelConfig() RedisSentinelConfig
+}
+
+// RedisSentinelConfig 哨兵配置
+type RedisSentinelConfig interface {
+	GetEnabled() bool
+	GetMaster() string
+	GetNodes() []string
+}
+
+// defaultRedisConfig redis 配置
+type defaultRedisConfig struct {
+	Enabled  bool          `json:"enabled"`
+	Conn     string        `json:"conn"`
+	Password string        `json:"password"`
+	DBNum    int           `json:"dbNum"`
+	Timeout  int           `json:"timeout"`
+	sentinel redisSentinel `json:"sentinel"`
+}
+
+type redisSentinel struct {
+	Enabled bool   `json:"enabled"`
+	Master  string `json:"master"`
+	Nodes   string `json:"nodes"`
+	nodes   []string
+}
+
+// GetEnabled redis 配置是否激活
+func (r defaultRedisConfig) GetEnabled() bool {
+	return r.Enabled
+}
+
+// GetConn redis 地址
+func (r defaultRedisConfig) GetConn() string {
+	return r.Conn
+}
+
+// GetPassword redis 密码
+func (r defaultRedisConfig) GetPassword() string {
+	return r.Password
+}
+
+// GetDBNum redis 数据库分区序号
+func (r defaultRedisConfig) GetDBNum() int {
+	return r.DBNum
+}
+
+// GetDBNum redis 数据库分区序号
+func (r defaultRedisConfig) GetSentinelConfig() RedisSentinelConfig {
+	return r.sentinel
+}
+
+// GetEnabled redis 哨兵配置是否激活
+func (s redisSentinel) GetEnabled() bool {
+	return s.Enabled
+}
+
+// GetMaster redis 主节点名
+func (s redisSentinel) GetMaster() string {
+	return s.Master
+}
+
+// GetNodes redis 哨兵节点列表
+func (s redisSentinel) GetNodes() []string {
+	if len(s.Nodes) != 0 {
+		for _, v := range strings.Split(s.Nodes, ",") {
+			v = strings.TrimSpace(v)
+			s.nodes = append(s.nodes, v)
+		}
+	}
+
+	return s.nodes
+}
+```
+
+`basic/config/jwt.go`
+
+```go
+package config
+
+// jwtConfig jwt 配置 接口
+type JwtConfig interface {
+	GetSecretKey() string
+}
+
+// defaultJwtConfig jwt 配置
+type defaultJwtConfig struct {
+	SecretKey string `json:"secretKey"`
+}
+
+// GetSecretKey jwt 密钥
+func (m defaultJwtConfig) GetSecretKey() string {
+	return m.SecretKey
+}
+```
+
+`basic/config/config.go` 增加部分
+
+```go
+var (
+    // ...
+	redisConfig				defaultRedisConfig
+	jwtConfig               defaultJwtConfig
+	// ...
+)
+
+func InitConfig() {
+    
+    // ...
+    config.Get(defaultRootPath, "redis").Scan(&redisConfig)
+    config.Get(defaultRootPath, "jwt").Scan(&jwtConfig)
+	// ...
+}
+
+// GetJwtConfig 获取Jwt配置
+func GetJwtConfig() (ret JwtConfig) {
+	return jwtConfig
+}
+
+// GetRedisConfig 获取Redis配置
+func GetRedisConfig() (ret RedisConfig) {
+	return redisConfig
+}
+```
+
+注意配置`basic/config/basic.go`
+
+```go
+package basic
+
+import (
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/db"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/redis"
+)
+
+func Init() {
+	config.Init()
+	db.Init()
+	redis.Init()
+}
+```
+
+### auth
+
+auth服务目前需要具备以下能力
+
+- 加载配置
+- 生成与验证token
+- 广播token失效
+
+那我们还需要给auth增加token生成策略，因此，我们引入[jwt](https://jwt.io/introduction/)。
+
+jwt是JSON Web Token的简称，它是web服务token安全验证的高效解决方案。本项目中，我们用它生成token与验证token。
+
+jwt Token属于自包含的token，它结构有三个部分组成
+
+- Header 键值对，声明token签名算法，类型等元数据信息
+- Payload 键值对，里面一般存放用户数据
+- Signature 由**Header+Payload+密钥**加密生成
+
+三者会被Base64-URL各自编码成字符串，再组合成`xxxxx.yyyyy.zzzzz`的形式。
+
+验证的过程就是重新再把**Header+Payload+密钥**加密，看二者的Signature是否一致。
+
+下引我们安装jwt的golang库和redis库，jwt生成后我们会放到redis中
+
+```shell
+$ go get -u github.com/dgrijalva/jwt-go
+$ go get -u github.com/go-redis/redis
+```
+
+使用模板生成**auth**服务代码
+
+```shell
+$ micro new --namespace=mu.micro.book --type=srv --alias=auth github.com/YuxinZhaozyx/GoMicroBookshop/auth
+```
+
+修改`auth/proto/auth/auth.proto`
+
+```protobuf
+syntax = "proto3";
+
+package mu.micro.book.srv.auth;
+
+service Service {
+	rpc MakeAccessToken(Request) returns (Response) {}
+	rpc DelUserAccessToken(Request) returns (Response) {}
+}
+
+message Error {
+	int32 code = 1;
+	string detail = 2;
+}
+
+message Request {
+	uint64 userId = 1;
+	string userName = 2;
+	string token = 3;
+}
+
+message Response {
+	bool success = 1;
+	Error error = 2;
+	string token = 3;
+}
+```
+
+生成原型文件：
+
+```shell
+$ cd auth
+$ protoc --proto_path=. --go_out=. --micro_out=. proto/auth/auth.proto
+```
+
+**添加配置文件**
+
+`auth/conf/application.yml`
+
+```yaml
+app:
+  jwt:
+    secretKey: W6VjDud2W1kMG3BicbMNlGgI4ZfcoHtMGLWr
+  profiles:
+    include: consul, redis
+```
+
+`auth/conf/application-consul.yml`
+
+```yaml
+app:
+  consul:
+    enabled: true
+    host: 127.0.0.1
+    port: 8500
+```
+
+`auth/conf/applicaton-redis.yml`
+
+```yaml
+app:
+  redis:
+    enabled: true
+    conn: 127.0.0.1:6379
+    dbNum: 8
+    password:
+    timeout: 3000
+    sentinel:
+      enabled: false
+      master: bookMaster
+      nodes: 127.0.0.1:16379,127.0.0.1:26379,127.0.0.1:36379
+```
+
+下面我们编写初始化Redis数据库的**Init**方法
+
+`basic/redis/redis.go`
+
+```go
+package redis
+
+import (
+	"sync"
+
+	"github.com/go-redis/redis"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
+	"github.com/micro/go-micro/util/log"
+)
+
+var (
+	client *redis.Client
+	m      sync.RWMutex
+	inited bool
+)
+
+// Init 初始化Redis
+func Init() {
+	m.Lock()
+	defer m.Unlock()
+
+	if inited {
+		log.Log("已经初始化过Redis...")
+		return
+	}
+
+	redisConfig := config.GetRedisConfig()
+
+	// 打开才加载
+	if redisConfig != nil && redisConfig.GetEnabled() {
+		log.Log("初始化Redis...")
+
+		// 加载哨兵模式
+		if redisConfig.GetSentinelConfig() != nil && redisConfig.GetSentinelConfig().GetEnabled() {
+			log.Log("初始化Redis，哨兵模式...")
+			initSentinel(redisConfig)
+		} else { // 普通模式
+			log.Log("初始化Redis，普通模式...")
+			initSingle(redisConfig)
+		}
+
+		log.Log("初始化Redis，检测连接...")
+
+		pong, err := client.Ping().Result()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+
+		log.Log("初始化Redis，检测连接Ping.")
+		log.Log("初始化Redis，检测连接Ping..")
+		log.Logf("初始化Redis，检测连接Ping... %s", pong)
+	}
+}
+
+// GetRedis 获取redis
+func GetRedis() *redis.Client {
+	return client
+}
+
+func initSentinel(redisConfig config.RedisConfig) {
+	client = redis.NewFailoverClient(&redis.FailoverOptions{
+		MasterName:    redisConfig.GetSentinelConfig().GetMaster(),
+		SentinelAddrs: redisConfig.GetSentinelConfig().GetNodes(),
+		DB:            redisConfig.GetDBNum(),
+		Password:      redisConfig.GetPassword(),
+	})
+
+}
+
+func initSingle(redisConfig config.RedisConfig) {
+	client = redis.NewClient(&redis.Options{
+		Addr:     redisConfig.GetConn(),
+		Password: redisConfig.GetPassword(), // no password set
+		DB:       redisConfig.GetDBNum(),    // use default DB
+	})
+}
+```
+
+我们新建目录[model](./basic/model)，将生成逻辑放到model包下，因为它不属于handler接口层需要处理的逻辑，将其封装到服务层或叫业务模型层。
+
+它的结构如下：
+
+```
+auth
+|
+...
+├── model
+│   ├── access             # 用户操作行为相关包
+│   │   ├── access.go      # 负责定义、初始化等
+│   │   ├── access_internal.go # 内部类，包含保存、清除缓存逻辑
+│   │   └── access_token.go    # 生成与获取token的主要代码
+│   └── model.go           # 业务模型初始化入口
+...
+```
+
+开始编写生成token与将其保存到redis的代码。
+
+`auth/model/access.go`
+
+```go
+package access
+
+import (
+	"fmt"
+	"sync"
+
+	r "github.com/go-redis/redis"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/redis"
+)
+
+var (
+	s  *service
+	ca *r.Client
+	m  sync.RWMutex
+)
+
+// service 服务
+type service struct {
+}
+
+// Service 用户服务类
+type Service interface {
+	// MakeAccessToken 生成token
+	MakeAccessToken(subject *Subject) (ret string, err error)
+
+	// GetCachedAccessToken 获取缓存的token
+	GetCachedAccessToken(subject *Subject) (ret string, err error)
+
+	// DelUserAccessToken 清除用户token
+	DelUserAccessToken(token string) (err error)
+}
+
+// GetService 获取服务类
+func GetService() (Service, error) {
+	if s == nil {
+		return nil, fmt.Errorf("[GetService] GetService 未初始化")
+	}
+	return s, nil
+}
+
+// Init 初始化用户服务层
+func Init() {
+	m.Lock()
+	defer m.Unlock()
+
+	if s != nil {
+		return
+	}
+
+	ca = redis.GetRedis()
+
+	s = &service{}
+}
+```
+
+我们定义了**service**服务结构，它提供两个方法：
+
+- MakeAccessToken 生成Token
+- GetCachedAccessToken 获取缓存的Token
+
+与其它服务类一样，入口方法都是**Init**，获取服务的方法都是**GetService**。
+
+接下来是生成与获取token的方法，它负责实现接口**Service**的两个方法**MakeAccessToken**和**GetCachedAccessToken**。
+
+`auth/model/access/access_token.go`
+
+```go
+package access
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/micro/go-micro/broker"
+	"github.com/micro/go-micro/util/log"
+)
+
+var (
+	// tokenExpiredDate app token过期日期 30天
+	tokenExpiredDate = 3600 * 24 * 30 * time.Second
+
+	// tokenIDKeyPrefix tokenID 前缀
+	tokenIDKeyPrefix = "token:auth:id:"
+
+	tokenExpiredTopic = "mu.micro.book.topic.auth.tokenExpired"
+)
+
+// Subject token 持有者
+type Subject struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// MakeAccessToken 生成token并保存到redis
+func (s *service) MakeAccessToken(subject *Subject) (ret string, err error) {
+	m, err := s.createTokenClaims(subject)
+	if err != nil {
+		return "", fmt.Errorf("[MakeAccessToken] 创建token Claim 失败，err: %s", err)
+	}
+
+	// 创建
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, m)
+	ret, err = token.SignedString([]byte(config.GetJwtConfig().GetSecretKey()))
+	if err != nil {
+		return "", fmt.Errorf("[MakeAccessToken] 创建token失败，err: %s", err)
+	}
+
+	// 保存到redis
+	err = s.saveTokenToCache(subject, ret)
+	if err != nil {
+		return "", fmt.Errorf("[MakeAccessToken] 保存token到缓存失败，err: %s", err)
+	}
+
+	return
+}
+
+// GetCachedAccessToken 获取token
+func (s *service) GetCachedAccessToken(subject *Subject) (ret string, err error) {
+	ret, err = s.getTokenFromCache(subject)
+	if err != nil {
+		return "", fmt.Errorf("[GetCachedAccessToken] 从缓存获取token失败，err: %s", err)
+	}
+
+	return
+}
+
+// DelUserAccessToken 清除用户token
+func (s *service) DelUserAccessToken(tk string) (err error) {
+	// 解析token字符串
+	claims, err := s.parseToken(tk)
+	if err != nil {
+		return fmt.Errorf("[DelUserAccessToken] 错误的token，err: %s", err)
+	}
+
+	// 通过解析到的用户id删除
+	err = s.delTokenFromCache(&Subject{
+		ID: claims.Subject,
+	})
+
+	if err != nil {
+		return fmt.Errorf("[DelUserAccessToken] 清除用户token，err: %s", err)
+	}
+
+	// 广播删除
+	msg := &broker.Message{
+		Body: []byte(claims.Subject),
+	}
+	if err := broker.Publish(tokenExpiredTopic, msg); err != nil {
+		log.Logf("[pub] 发布token删除消息失败： %v", err)
+	} else {
+		fmt.Println("[pub] 发布token删除消息：", string(msg.Body))
+	}
+
+	return
+}
+```
+
+`auth/model/access/access_internal.go `则是实现内部方法，比如获取缓存key，保存与清除缓存等。
+
+```go
+package access
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
+	"github.com/dgrijalva/jwt-go"
+)
+
+// createTokenClaims Claims
+func (s *service) createTokenClaims(subject *Subject) (m *jwt.StandardClaims, err error) {
+	now := time.Now()
+	m = &jwt.StandardClaims{
+		ExpiresAt: now.Add(tokenExpiredDate).Unix(),
+		NotBefore: now.Unix(),
+		Id:        subject.ID,
+		IssuedAt:  now.Unix(),
+		Issuer:    "book.micro.mu",
+		Subject:   subject.ID,
+	}
+
+	return
+}
+
+// saveTokenToCache 保存token到缓存
+func (s *service) saveTokenToCache(subject *Subject, val string) (err error) {
+	//保存
+	if err = ca.Set(tokenIDKeyPrefix+subject.ID, val, tokenExpiredDate).Err(); err != nil {
+		return fmt.Errorf("[saveTokenToCache] 保存token到缓存发生错误，err:" + err.Error())
+	}
+	return
+}
+
+// delTokenFromCache 清空token
+func (s *service) delTokenFromCache(subject *Subject) (err error) {
+	//保存
+	if err = ca.Del(tokenIDKeyPrefix + subject.ID).Err(); err != nil {
+		return fmt.Errorf("[delTokenFromCache] 清空token 缓存发生错误，err:" + err.Error())
+	}
+	return
+}
+
+// getTokenFromCache 从缓存获取token
+func (s *service) getTokenFromCache(subject *Subject) (token string, err error) {
+	// 获取
+	tokenCached, err := ca.Get(tokenIDKeyPrefix + subject.ID).Result()
+	if err != nil {
+		return token, fmt.Errorf("[getTokenFromCache] token不存在 %s", err)
+	}
+
+	return string(tokenCached), nil
+}
+
+// parseToken 解析token
+func (s *service) parseToken(tk string) (c *jwt.StandardClaims, err error) {
+	token, err := jwt.Parse(tk, func(token *jwt.Token) (interface{}, error) {
+		_, ok := token.Method.(*jwt.SigningMethodHMAC)
+		if !ok {
+			return nil, fmt.Errorf("不合法的token格式: %v", token.Header["alg"])
+		}
+		return []byte(config.GetJwtConfig().GetSecretKey()), nil
+	})
+
+	// jwt 框架自带了一些检测，如过期，发布者错误等
+	if err != nil {
+		switch e := err.(type) {
+		case *jwt.ValidationError:
+			switch e.Errors {
+			case jwt.ValidationErrorExpired:
+				return nil, fmt.Errorf("[parseToken] 过期的token, err:%s", err)
+			default:
+				break
+			}
+			break
+		default:
+			break
+		}
+
+		return nil, fmt.Errorf("[parseToken] 不合法的token, err:%s", err)
+	}
+
+	// 检测合法
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("[parseToken] 不合法的token")
+	}
+
+	return mapClaimToJwClaim(claims), nil
+}
+
+// 把jwt的claim转成claims
+func mapClaimToJwClaim(claims jwt.MapClaims) *jwt.StandardClaims {
+	jC := &jwt.StandardClaims{
+		Subject: claims["sub"].(string),
+	}
+
+	return jC
+}
+```
+
+*对于生产环境的token，光有用户id和用户名是不够的，还需要其他客户端环境信息，比如ip、浏览器指纹、手机MEID等等可以识别客户端在一定范围内唯一性的标识。
+
+这样才能保证token即使泄漏，也极难有可能盗用，我们是为了演示尽可能简单些，省去一些体力活。
+
+下面我们改造**auth**的main方法，让其能加载配置：
+
+`auth/main.go`
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/YuxinZhaozyx/GoMicroBookshop/auth/handler"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/auth/model"
+	s "github.com/YuxinZhaozyx/GoMicroBookshop/auth/proto/auth"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
+	"github.com/micro/cli"
+	"github.com/micro/go-micro"
+	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/registry/consul"
+	"github.com/micro/go-micro/util/log"
+)
+
+func main() {
+	// 初始化配置、数据库等信息
+	basic.Init()
+
+	// 使用consul注册
+	micReg := consul.NewRegistry(registryOptions)
+
+	// 新建服务
+	service := micro.NewService(
+		micro.Name("mu.micro.book.srv.auth"),
+		micro.Registry(micReg),
+		micro.Version("latest"),
+	)
+
+	// 服务初始化
+	service.Init(
+		micro.Action(func(c *cli.Context) {
+			// 初始化handler
+			model.Init()
+			// 初始化handler
+			handler.Init()
+		}),
+	)
+
+	// 注册服务
+	s.RegisterServiceHandler(service.Server(), new(handler.Service))
+
+	// 启动服务
+	if err := service.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func registryOptions(ops *registry.Options) {
+	consulCfg := config.GetConsulConfig()
+	ops.Timeout = time.Second * 5
+	ops.Addrs = []string{fmt.Sprintf("%s:%d", consulCfg.GetHost(), consulCfg.GetPort())}
+}
+```
+
+同样，在main入口立即初始化基础组件，在Action中初始化业务组件。
+
+至此，auth服务基本完成了。下面开始改造**user-web**服务。
+
+### user-web
+
+**user-web**改动不大，我们只需要改两点
+
+- 把原来的基础包**basic**删除，使用公用包的初始化方法。这一步我们略过，大家直接手动删除即可。
+- 改造Login方法，增加获取token逻辑
+- 返回带token的set-cookie头信息。
+- 增加退出方法Logout
+
+`user-web/handler/handler.go`
+
+```go
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	auth "github.com/YuxinZhaozyx/GoMicroBookshop/auth/proto/auth"
+	user "github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/proto/user"
+	"github.com/micro/go-micro/client"
+	"github.com/micro/go-micro/util/log"
+)
+
+var (
+	serviceClient user.UserService
+	authClient    auth.Service
+)
+
+// Error 错误结构体
+type Error struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+}
+
+// Init 初始化
+func Init() {
+	serviceClient = user.NewUserService("mu.micro.book.srv.user", client.DefaultClient)
+	authClient = auth.NewService("mu.micro.book.srv.auth", client.DefaultClient)
+}
+
+// Login 登录入口
+func Login(w http.ResponseWriter, r *http.Request) {
+	// 只接受POST请求
+	if r.Method != "POST" {
+		log.Logf("非法请求")
+		http.Error(w, "非法请求", 400)
+		return
+	}
+
+	r.ParseForm()
+
+	// 调用后台服务
+	rsp, err := serviceClient.QueryUserByName(context.TODO(), &user.Request{
+		UserName: r.Form.Get("userName"),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// 返回结果
+	response := map[string]interface{}{
+		"ref": time.Now().UnixNano(),
+	}
+
+	if rsp.User.Pwd == r.Form.Get("pwd") {
+		response["success"] = rsp.Success
+
+		// 干掉密码返回
+		rsp.User.Pwd = ""
+		response["data"] = rsp.User
+
+		log.Logf("[Login] 密码校验完成，生成token...")
+
+		// 生成token
+		rsp2, err := authClient.MakeAccessToken(context.TODO(), &auth.Request{
+			UserId:   rsp.User.Id,
+			UserName: rsp.User.Name,
+		})
+		if err != nil {
+			log.Logf("[Login] 创建token失败，err：%s", err)
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		log.Logf("[Login] token %s", rsp2.Token)
+		response["token"] = rsp2.Token
+
+		// 同时将token写到cookies中
+		w.Header().Add("set-cookie", "application/json; charset=utf-8")
+		// 过期30分钟
+		expire := time.Now().Add(30 * time.Minute)
+		cookie := http.Cookie{Name: "remember-me-token", Value: rsp2.Token, Path: "/", Expires: expire, MaxAge: 90000}
+		http.SetCookie(w, &cookie)
+	} else {
+		response["success"] = false
+		response["error"] = &Error{
+			Detail: "密码错误",
+		}
+	}
+
+	w.Header().Add("Content-Type", "application/json; charset=utf-8")
+
+	// encode and write the response as json 返回json结构
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+}
+
+// Logout 退出登录
+func Logout(w http.ResponseWriter, r *http.Request) {
+	// 只接受POST请求
+	if r.Method != "POST" {
+		log.Logf("非法请求")
+		http.Error(w, "非法请求", 400)
+		return
+	}
+
+	tokenCookie, err := r.Cookie("remember-me-token")
+	if err != nil {
+		log.Logf("token获取失败")
+		http.Error(w, "非法请求", 400)
+		return
+	}
+
+	// 删除token
+	_, err = authClient.DelUserAccessToken(context.TODO(), &auth.Request{
+		Token: tokenCookie.Value,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// 清除cookie
+	cookie := http.Cookie{Name: "remember-me-token", Value: "", Path: "/", Expires: time.Now().Add(0 * time.Second), MaxAge: 0}
+	http.SetCookie(w, &cookie)
+
+	w.Header().Add("Content-Type", "application/json; charset=utf-8")
+
+	// 返回结果
+	response := map[string]interface{}{
+		"ref":     time.Now().UnixNano(),
+		"success": true,
+	}
+
+	// 返回JSON结构
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+}
+```
+
+`user-web/main.go`
+
+```go
+func main() {
+	// ...
+
+	// register call handler 注册登录接口
+	service.HandleFunc("/user/login", handler.Login)
+	service.HandleFunc("/user/logout", handler.Logout)
+
+    // ...
+}
+```
+
+
+
+注：第一章的`user-srv/proto/user/user.go`中的`User.Id`类型被错误地声明为了`int64`，要改成`uint64`.
+
+
+
+我们在代码中作了如下改动
+
+- 新增了auth客户端**authClient**并在Init中初始化。
+- Login 方法中在获取用户信息并比对密码完成后向auth服务申请token，返回时带上token。
+- Logout 方法将用户的token发送到auth服务，让auth将token清空
+
+### 测试
+
+那我们所有的代码都已经写完了，下面我们开始运行程序
+
+打开consul
+
+```shell
+$ conusl agent --dev
+```
+
+打开redis
+
+```shell
+$ redis-server <redis-dir>/redis.windos.conf
+```
+
+运行api
+
+```shell
+$ micro --registry=consul --api_namespace=mu.micro.book.web  api --handler=web
+```
+
+运行user-srv
+
+```shell
+$ cd user-srv
+$ go run main.go plugin.go 
+```
+
+运行user-web
+
+```shell
+$ cd user-web
+$ go run main.go
+```
+
+运行auth
+
+```shell
+$ cd auth
+$ go run main.go
+```
+
+请求登录
+
+```shell
+$ curl --request POST   --url http://127.0.0.1:8080/user/login   --header 'Content-Type: application/x-www-form-urlencoded'  --data 'userName=micro&pwd=1234'
+```
+
+返回结果
+
+```json
+{
+    "data": {
+        "id": 10001,
+        "name": "micro"
+    },
+    "ref": 1563599619098945400,
+    "success": true,
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE1NjYxOTE2MTksImp0aSI6IjEwMDAxIiwiaWF0IjoxNTYzNTk5NjE5LCJpc3MiOiJib29rLm1pY3JvLm11IiwibmJmIjoxNTYzNTk5NjE5LCJzdWIiOiIxMDAwMSJ9.9ao8hv8B4rF197ZaE8Ox9uTPV5CMAkTITysFQG1OM5U"
+}
+```
+
+退出登录（需要将token换成实际的）
+
+```shell
+$ curl --request POST \
+  --url http://127.0.0.1:8080/user/logout \
+  --cookie 'remember-me-token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE1NjYxOTE2MTksImp0aSI6IjEwMDAxIiwiaWF0IjoxNTYzNTk5NjE5LCJpc3MiOiJib29rLm1pY3JvLm11IiwibmJmIjoxNTYzNTk5NjE5LCJzdWIiOiIxMDAwMSJ9.9ao8hv8B4rF197ZaE8Ox9uTPV5CMAkTITysFQG1OM5U'
+```
+
+```json
+{
+	"ref": 1563600169440144300,
+	"success": true
+}
+```
+

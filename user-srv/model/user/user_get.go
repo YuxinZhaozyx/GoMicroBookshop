@@ -1,7 +1,7 @@
 package user
 
 import (
-	"github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/basic/db"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/db"
 	proto "github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/proto/user"
 	"github.com/micro/go-micro/util/log"
 )

@@ -6,8 +6,8 @@ import (
 
 	"github.com/micro/go-micro/util/log"
 
-	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/basic"
-	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/basic/config"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
 	"github.com/YuxinZhaozyx/GoMicroBookshop/user-web/handler"
 	"github.com/micro/cli"
 	"github.com/micro/go-micro/registry"
@@ -42,6 +42,7 @@ func main() {
 
 	// register call handler 注册登录接口
 	service.HandleFunc("/user/login", handler.Login)
+	service.HandleFunc("/user/logout", handler.Logout)
 
 	// run service 运行服务
 	if err := service.Run(); err != nil {

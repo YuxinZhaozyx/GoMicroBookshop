@@ -3,7 +3,7 @@ package db
 import (
 	"database/sql"
 
-	"github.com/YuxinZhaozyx/GoMicroBookshop/user-srv/basic/config"
+	"github.com/YuxinZhaozyx/GoMicroBookshop/basic/config"
 	"github.com/micro/go-micro/util/log"
 
 	_ "github.com/go-sql-driver/mysql"
